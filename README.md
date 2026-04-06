@@ -9,6 +9,7 @@
 - 长按键盘右方向键 `ArrowRight` 超过 `150ms`，临时切到 `3x`
 - 松开右方向键后，恢复到页面原本的播放速度
 - 短按右方向键时，尽量保留页面自带的快进行为
+- 放行 `Command + 1~9`，避免页面脚本拦截 Chrome 的切标签快捷键
 
 ## 当前文件
 
@@ -21,6 +22,12 @@
 - `TARGET_RATE = 3`
 - `HOLD_DELAY = 150`
 - `FORWARD_KEY = 'ArrowRight'`
+
+## 快捷键说明
+
+- `ArrowRight` 短按：尽量保持页面原本快进
+- `ArrowRight` 长按：进入临时 `3x`
+- `Command + 1~9`：继续由 Chrome 处理，用来切换标签页
 
 ## 安装方式
 

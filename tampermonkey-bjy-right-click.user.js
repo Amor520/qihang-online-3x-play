@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BJY Right Click Control
 // @namespace    http://tampermonkey.net/
-// @version      2.6.0
-// @description  长按方向右键临时三倍速，短按保留页面原本快进
+// @version      2.6.1
+// @description  长按方向右键临时三倍速，短按保留页面原本快进，并放行 Command+数字切标签
 // @match        https://pre.iqihang.com/ark/record/*
 // @grant        none
 // @run-at       document-start
@@ -448,6 +448,20 @@
     return !!event && event.key === FORWARD_KEY;
   }
 
+  function isBrowserTabSwitchShortcut(event) {
+    if (!event) return false;
+    if (!event.metaKey || event.ctrlKey || event.altKey) return false;
+
+    return /^[1-9]$/.test(event.key || '') || /^Digit[1-9]$/.test(event.code || '');
+  }
+
+  function allowBrowserShortcut(event) {
+    if (!isBrowserTabSwitchShortcut(event)) return;
+
+    event.stopImmediatePropagation();
+    event.stopPropagation();
+  }
+
   function isEditableTarget(target) {
     if (!target || !(target instanceof Element)) return false;
 
@@ -509,6 +523,8 @@
       subtree: true,
     });
 
+    document.addEventListener('keydown', allowBrowserShortcut, true);
+    window.addEventListener('keyup', allowBrowserShortcut, true);
     document.addEventListener('keydown', onForwardKeyDown, true);
     window.addEventListener('keyup', onForwardKeyUp, true);
     window.addEventListener('blur', stopBoost, true);

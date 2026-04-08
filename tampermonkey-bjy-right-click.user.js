@@ -17,12 +17,14 @@
   const FULLSCREEN_KEY = 'f';
   const AUTO_ADVANCE_COOLDOWN = 1500;
   const FULLSCREEN_RESTORE_WINDOW = 5000;
+  const AUTO_PLAY_RETRY_DELAYS = [120, 500, 1200, 2400, 4000, 6500];
   const RATE_TRIGGER_SELECTORS = [
     '.ccH5sp',
     '[class*="ccH5sp"]',
     '[data-has-bind-mouseover="true"]',
   ];
   const RATE_MENU_SELECTORS = ['.ccH5spul', '[class*="ccH5spul"]'];
+  const PLAYER_PLAY_SELECTORS = ['.ccH5PlayBtn', '.vjs-big-play-button'];
   const PLAYER_FULLSCREEN_ENTER_SELECTORS = ['.ccH5FullsBtn'];
   const PLAYER_FULLSCREEN_EXIT_SELECTORS = ['.ccH5ExitFullsBtn'];
   const RIGHT_PANEL_SELECTOR = '.record--slide';
@@ -49,6 +51,7 @@
   let lastAutoAdvanceKey = '';
   let lastAutoAdvanceAt = 0;
   let fullscreenRestoreUntil = 0;
+  let autoPlayAttemptToken = 0;
 
   function ensureBadge() {
     if (badgeEl && document.contains(badgeEl)) return badgeEl;
@@ -536,6 +539,95 @@
       : getElementBySelectors(PLAYER_FULLSCREEN_EXIT_SELECTORS);
   }
 
+  function getPlayerPlayButton(preferVisible = true) {
+    return preferVisible
+      ? getVisibleElementBySelectors(PLAYER_PLAY_SELECTORS) ||
+          getElementBySelectors(PLAYER_PLAY_SELECTORS)
+      : getElementBySelectors(PLAYER_PLAY_SELECTORS);
+  }
+
+  function isVideoPlaying(video = getMainVideo()) {
+    return !!video && !video.paused && !video.ended && video.readyState >= 2;
+  }
+
+  function tryAutoPlay(video = getMainVideo()) {
+    if (!video || isVideoPlaying(video)) return;
+
+    const tryButtonFallback = () => {
+      if (isVideoPlaying(video) || !video.paused || video.ended) return;
+      const playButton = getPlayerPlayButton();
+      if (playButton) clickElement(playButton);
+    };
+
+    try {
+      const result = video.play();
+      if (result && typeof result.then === 'function') {
+        result
+          .then(() => {
+            if (isVideoPlaying(video)) {
+              updateBadge('BJY RC autoplay', '#166534');
+            }
+          })
+          .catch(() => {
+            tryButtonFallback();
+          });
+        return;
+      }
+    } catch (error) {
+      // Ignore and fall back to the player's own play button.
+    }
+
+    tryButtonFallback();
+    window.setTimeout(() => {
+      if (isVideoPlaying(video)) {
+        updateBadge('BJY RC autoplay', '#166534');
+      }
+    }, 80);
+  }
+
+  function scheduleAutoPlay(video = trackedVideo || getMainVideo()) {
+    if (!video) return;
+
+    const token = ++autoPlayAttemptToken;
+    AUTO_PLAY_RETRY_DELAYS.forEach((delay) => {
+      window.setTimeout(() => {
+        if (token !== autoPlayAttemptToken) return;
+        if (trackedVideo !== video) return;
+        if (!document.contains(video)) return;
+        if (isVideoPlaying(video)) return;
+        if (video.ended) return;
+        tryAutoPlay(video);
+      }, delay);
+    });
+  }
+
+  function suppressBeforeUnloadPrompt() {
+    const clearBeforeUnloadState = () => {
+      try {
+        window.onbeforeunload = null;
+      } catch (error) {
+        // Ignore assignment failures from hostile pages.
+      }
+    };
+
+    clearBeforeUnloadState();
+    window.addEventListener(
+      'beforeunload',
+      (event) => {
+        clearBeforeUnloadState();
+        event.stopImmediatePropagation();
+        event.stopPropagation();
+        try {
+          delete event.returnValue;
+        } catch (error) {
+          event.returnValue = undefined;
+        }
+        return undefined;
+      },
+      true,
+    );
+  }
+
   function isPlayerFullscreenActive() {
     const exitButton = getPlayerFullscreenExitButton(false);
     const enterButton = getPlayerFullscreenEnterButton(false);
@@ -718,6 +810,7 @@
   }
 
   function handleTrackedVideoPlayable() {
+    tryAutoPlay(trackedVideo);
     if (Date.now() > fullscreenRestoreUntil) return;
     scheduleFullscreenRestoreChecks();
   }
@@ -729,6 +822,7 @@
     if (trackedVideo) {
       trackedVideo.removeEventListener('ended', handleVideoEnded, true);
       trackedVideo.removeEventListener('play', handleTrackedVideoPlayable, true);
+      trackedVideo.removeEventListener('canplay', handleTrackedVideoPlayable, true);
       trackedVideo.removeEventListener('loadedmetadata', handleTrackedVideoPlayable, true);
     }
 
@@ -737,7 +831,9 @@
 
     trackedVideo.addEventListener('ended', handleVideoEnded, true);
     trackedVideo.addEventListener('play', handleTrackedVideoPlayable, true);
+    trackedVideo.addEventListener('canplay', handleTrackedVideoPlayable, true);
     trackedVideo.addEventListener('loadedmetadata', handleTrackedVideoPlayable, true);
+    scheduleAutoPlay(trackedVideo);
     return true;
   }
 
@@ -774,6 +870,7 @@
 
   function init() {
     window.__BJY_RIGHT_CLICK_CONTROL__ = 'loaded';
+    suppressBeforeUnloadPrompt();
     ensureBadge();
     updateBadge('BJY RC waiting player', '#92400e');
 

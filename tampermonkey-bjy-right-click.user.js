@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BJY Right Click Control
 // @namespace    http://tampermonkey.net/
-// @version      2.6.1
-// @description  长按方向右键临时三倍速，短按保留页面原本快进，并放行 Command+数字切标签
+// @version      2.8.0
+// @description  长按方向右键临时三倍速，支持播放器原生全屏、全屏播完自动下一节，并默认收起右侧目录
 // @match        https://pre.iqihang.com/ark/record/*
 // @grant        none
 // @run-at       document-start
@@ -14,12 +14,25 @@
   const TARGET_RATE = 3;
   const HOLD_DELAY = 150;
   const FORWARD_KEY = 'ArrowRight';
+  const FULLSCREEN_KEY = 'f';
+  const AUTO_ADVANCE_COOLDOWN = 1500;
+  const FULLSCREEN_RESTORE_WINDOW = 5000;
   const RATE_TRIGGER_SELECTORS = [
     '.ccH5sp',
     '[class*="ccH5sp"]',
     '[data-has-bind-mouseover="true"]',
   ];
   const RATE_MENU_SELECTORS = ['.ccH5spul', '[class*="ccH5spul"]'];
+  const PLAYER_FULLSCREEN_ENTER_SELECTORS = ['.ccH5FullsBtn'];
+  const PLAYER_FULLSCREEN_EXIT_SELECTORS = ['.ccH5ExitFullsBtn'];
+  const RIGHT_PANEL_SELECTOR = '.record--slide';
+  const RIGHT_PANEL_TOGGLE_SELECTOR = '.packup-icon';
+  const RIGHT_PANEL_OPEN_CLASS = 'unpackup';
+  const CHAPTER_TREE_SELECTOR = '.learn--tree';
+  const CHAPTER_ITEM_SELECTOR = '.learn--tree__content.have-content';
+  const CHAPTER_ITEM_ACTIVE_SELECTOR =
+    '.learn--tree__content.learn--tree__content--active.have-content';
+  const CHAPTER_ITEM_CLICK_SELECTOR = '.learn--tree__content--container';
 
   let badgeEl = null;
   let holdTimer = null;
@@ -27,9 +40,15 @@
   let boosting = false;
   let forwardKeyHeld = false;
   let activeVideo = null;
+  let trackedVideo = null;
   let originalRate = 1;
   let originalRateLabel = '';
   let originalRateValue = '';
+  let readyAnnounced = false;
+  let hasAutoCollapsedRightPanel = false;
+  let lastAutoAdvanceKey = '';
+  let lastAutoAdvanceAt = 0;
+  let fullscreenRestoreUntil = 0;
 
   function ensureBadge() {
     if (badgeEl && document.contains(badgeEl)) return badgeEl;
@@ -71,6 +90,10 @@
       .replace(/\s+/g, '')
       .replace(/倍速/g, '')
       .trim();
+  }
+
+  function normalizeKey(key) {
+    return String(key || '').trim().toLowerCase();
   }
 
   function isVisibleElement(el) {
@@ -264,13 +287,14 @@
   }
 
   function clickElement(el) {
-    if (!el) return;
+    if (!el) return false;
     fireMouseEvent(el, 'pointerdown');
     fireMouseEvent(el, 'mousedown');
     fireMouseEvent(el, 'pointerup');
     fireMouseEvent(el, 'mouseup');
     fireMouseEvent(el, 'click');
     if (typeof el.click === 'function') el.click();
+    return true;
   }
 
   function findRateOption(spec) {
@@ -448,15 +472,21 @@
     return !!event && event.key === FORWARD_KEY;
   }
 
-  function isBrowserTabSwitchShortcut(event) {
-    if (!event) return false;
-    if (!event.metaKey || event.ctrlKey || event.altKey) return false;
+  function isBrowserShortcut(event) {
+    if (!event || event.altKey) return false;
+    if (!event.metaKey && !event.ctrlKey) return false;
 
-    return /^[1-9]$/.test(event.key || '') || /^Digit[1-9]$/.test(event.code || '');
+    const key = normalizeKey(event.key);
+    return (
+      /^[1-9]$/.test(event.key || '') ||
+      /^Digit[1-9]$/.test(event.code || '') ||
+      key === 'w' ||
+      key === 'r'
+    );
   }
 
   function allowBrowserShortcut(event) {
-    if (!isBrowserTabSwitchShortcut(event)) return;
+    if (!isBrowserShortcut(event)) return;
 
     event.stopImmediatePropagation();
     event.stopPropagation();
@@ -468,6 +498,247 @@
     return !!target.closest(
       'input, textarea, select, [contenteditable=""], [contenteditable="true"], [role="textbox"]',
     );
+  }
+
+  function isFullscreenKeyEvent(event) {
+    if (!event) return false;
+    if (event.metaKey || event.ctrlKey || event.altKey) return false;
+    return normalizeKey(event.key) === FULLSCREEN_KEY;
+  }
+
+  function getVisibleElementBySelectors(selectors, root = document) {
+    for (const selector of selectors) {
+      const match = Array.from(root.querySelectorAll(selector)).find(isVisibleElement);
+      if (match) return match;
+    }
+    return null;
+  }
+
+  function getElementBySelectors(selectors, root = document) {
+    for (const selector of selectors) {
+      const match = root.querySelector(selector);
+      if (match) return match;
+    }
+    return null;
+  }
+
+  function getPlayerFullscreenEnterButton(preferVisible = true) {
+    return preferVisible
+      ? getVisibleElementBySelectors(PLAYER_FULLSCREEN_ENTER_SELECTORS) ||
+          getElementBySelectors(PLAYER_FULLSCREEN_ENTER_SELECTORS)
+      : getElementBySelectors(PLAYER_FULLSCREEN_ENTER_SELECTORS);
+  }
+
+  function getPlayerFullscreenExitButton(preferVisible = true) {
+    return preferVisible
+      ? getVisibleElementBySelectors(PLAYER_FULLSCREEN_EXIT_SELECTORS) ||
+          getElementBySelectors(PLAYER_FULLSCREEN_EXIT_SELECTORS)
+      : getElementBySelectors(PLAYER_FULLSCREEN_EXIT_SELECTORS);
+  }
+
+  function isPlayerFullscreenActive() {
+    const exitButton = getPlayerFullscreenExitButton(false);
+    const enterButton = getPlayerFullscreenEnterButton(false);
+
+    if (exitButton && isVisibleElement(exitButton)) return true;
+    if (enterButton && isVisibleElement(enterButton)) return false;
+    if (document.fullscreenElement || document.webkitFullscreenElement) return true;
+
+    return false;
+  }
+
+  function toggleFullscreen() {
+    const exitButton = getPlayerFullscreenExitButton();
+    const enterButton = getPlayerFullscreenEnterButton();
+    const target = isPlayerFullscreenActive() ? exitButton || enterButton : enterButton || exitButton;
+
+    return clickElement(target);
+  }
+
+  function onFullscreenKeyDown(event) {
+    if (!isFullscreenKeyEvent(event)) return;
+    if (isEditableTarget(event.target)) return;
+    if (event.repeat) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    toggleFullscreen();
+  }
+
+  function getBestRightPanel() {
+    const panels = Array.from(document.querySelectorAll(RIGHT_PANEL_SELECTOR));
+    if (!panels.length) return null;
+
+    const visiblePanel = panels
+      .filter((panel) => {
+        const style = window.getComputedStyle(panel);
+        return style.display !== 'none' && style.visibility !== 'hidden';
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return br.width * br.height - ar.width * ar.height;
+      })[0];
+
+    return visiblePanel || panels[0];
+  }
+
+  function getRightPanelToggle() {
+    return (
+      Array.from(document.querySelectorAll(RIGHT_PANEL_TOGGLE_SELECTOR)).find(isVisibleElement) ||
+      document.querySelector(RIGHT_PANEL_TOGGLE_SELECTOR)
+    );
+  }
+
+  function isRightPanelExpanded(panel = getBestRightPanel(), toggle = getRightPanelToggle()) {
+    if (toggle && toggle.classList.contains(RIGHT_PANEL_OPEN_CLASS)) return true;
+    if (!panel) return false;
+
+    const style = window.getComputedStyle(panel);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    const rect = panel.getBoundingClientRect();
+    return rect.width > 80 && rect.height > 80;
+  }
+
+  function collapseRightPanelIfNeeded() {
+    if (hasAutoCollapsedRightPanel) return false;
+
+    const panel = getBestRightPanel();
+    const toggle = getRightPanelToggle();
+    if (!panel && !toggle) return false;
+
+    if (!isRightPanelExpanded(panel, toggle)) {
+      hasAutoCollapsedRightPanel = true;
+      return true;
+    }
+
+    if (!toggle) return false;
+    hasAutoCollapsedRightPanel = true;
+    return clickElement(toggle);
+  }
+
+  function getActiveChapterItem() {
+    const activeItems = Array.from(document.querySelectorAll(CHAPTER_ITEM_ACTIVE_SELECTOR));
+    if (!activeItems.length) return null;
+
+    return activeItems.find(isVisibleElement) || activeItems[0];
+  }
+
+  function getChapterItemsForActiveTree(activeItem) {
+    const tree = activeItem ? activeItem.closest(CHAPTER_TREE_SELECTOR) : null;
+    const scopedItems = tree ? Array.from(tree.querySelectorAll(CHAPTER_ITEM_SELECTOR)) : [];
+    return scopedItems.length ? scopedItems : Array.from(document.querySelectorAll(CHAPTER_ITEM_SELECTOR));
+  }
+
+  function getChapterItemKey(item) {
+    if (!item) return '';
+
+    const titleEl = item.querySelector('.title-text');
+    const idPart = item.id ? `id:${item.id}` : '';
+    const textPart = normalizeText(titleEl ? titleEl.textContent : item.textContent);
+    return `${idPart}|${textPart}`;
+  }
+
+  function findNextChapterItem() {
+    const activeItem = getActiveChapterItem();
+    if (!activeItem) return null;
+
+    const items = getChapterItemsForActiveTree(activeItem);
+    if (!items.length) return null;
+
+    const currentKey = getChapterItemKey(activeItem);
+    let activeIndex = items.indexOf(activeItem);
+
+    if (activeIndex < 0 && currentKey) {
+      activeIndex = items.findIndex((item) => getChapterItemKey(item) === currentKey);
+    }
+
+    if (activeIndex < 0) return null;
+    return items.slice(activeIndex + 1).find(Boolean) || null;
+  }
+
+  function scheduleFullscreenRestoreChecks() {
+    [180, 450, 900, 1600, 2600].forEach((delay) => {
+      window.setTimeout(() => {
+        if (Date.now() > fullscreenRestoreUntil) return;
+        if (isPlayerFullscreenActive()) {
+          fullscreenRestoreUntil = 0;
+          return;
+        }
+
+        const enterButton = getPlayerFullscreenEnterButton();
+        if (!enterButton) return;
+        clickElement(enterButton);
+
+        window.setTimeout(() => {
+          if (isPlayerFullscreenActive()) fullscreenRestoreUntil = 0;
+        }, 80);
+      }, delay);
+    });
+  }
+
+  function advanceToNextChapter() {
+    const activeItem = getActiveChapterItem();
+    const nextItem = findNextChapterItem();
+    if (!activeItem || !nextItem) return false;
+
+    const advanceKey = `${getChapterItemKey(activeItem)}=>${getChapterItemKey(nextItem)}`;
+    const now = Date.now();
+    if (advanceKey === lastAutoAdvanceKey && now - lastAutoAdvanceAt < AUTO_ADVANCE_COOLDOWN) {
+      return false;
+    }
+
+    lastAutoAdvanceKey = advanceKey;
+    lastAutoAdvanceAt = now;
+
+    const target = nextItem.querySelector(CHAPTER_ITEM_CLICK_SELECTOR) || nextItem;
+    const clicked = clickElement(target);
+    if (clicked) {
+      updateBadge('BJY RC next lesson', '#166534');
+      scheduleFullscreenRestoreChecks();
+    }
+
+    return clicked;
+  }
+
+  function handleVideoEnded() {
+    if (!isPlayerFullscreenActive()) return;
+
+    fullscreenRestoreUntil = Date.now() + FULLSCREEN_RESTORE_WINDOW;
+    const advanced = advanceToNextChapter();
+    if (!advanced) {
+      fullscreenRestoreUntil = 0;
+      updateBadge('BJY RC list end', '#92400e');
+    }
+  }
+
+  function handleTrackedVideoPlayable() {
+    if (Date.now() > fullscreenRestoreUntil) return;
+    scheduleFullscreenRestoreChecks();
+  }
+
+  function bindVideoListeners() {
+    const video = getMainVideo();
+    if (video === trackedVideo) return !!trackedVideo;
+
+    if (trackedVideo) {
+      trackedVideo.removeEventListener('ended', handleVideoEnded, true);
+      trackedVideo.removeEventListener('play', handleTrackedVideoPlayable, true);
+      trackedVideo.removeEventListener('loadedmetadata', handleTrackedVideoPlayable, true);
+    }
+
+    trackedVideo = video;
+    if (!trackedVideo) return false;
+
+    trackedVideo.addEventListener('ended', handleVideoEnded, true);
+    trackedVideo.addEventListener('play', handleTrackedVideoPlayable, true);
+    trackedVideo.addEventListener('loadedmetadata', handleTrackedVideoPlayable, true);
+    return true;
   }
 
   function onForwardKeyDown(event) {
@@ -507,24 +778,35 @@
     updateBadge('BJY RC waiting player', '#92400e');
 
     const bindIfReady = () => {
-      if (!getMainVideo() && !getRateLabelElement()) return false;
-      updateBadge('BJY RC ready', '#1d4ed8');
+      const hasVideo = bindVideoListeners();
+      const hasRateControl = !!getRateLabelElement();
+      if (!hasVideo && !hasRateControl) return false;
+
+      if (!readyAnnounced) {
+        readyAnnounced = true;
+        updateBadge('BJY RC ready', '#1d4ed8');
+      }
       return true;
     };
 
     bindIfReady();
+    collapseRightPanelIfNeeded();
+    window.setTimeout(collapseRightPanelIfNeeded, 300);
+    window.setTimeout(collapseRightPanelIfNeeded, 1000);
 
-    const observer = new MutationObserver(() => {
-      if (bindIfReady()) observer.disconnect();
+    const pageObserver = new MutationObserver(() => {
+      bindIfReady();
+      if (!hasAutoCollapsedRightPanel) collapseRightPanelIfNeeded();
     });
 
-    observer.observe(document.documentElement, {
+    pageObserver.observe(document.documentElement, {
       childList: true,
       subtree: true,
     });
 
     document.addEventListener('keydown', allowBrowserShortcut, true);
     window.addEventListener('keyup', allowBrowserShortcut, true);
+    document.addEventListener('keydown', onFullscreenKeyDown, true);
     document.addEventListener('keydown', onForwardKeyDown, true);
     window.addEventListener('keyup', onForwardKeyUp, true);
     window.addEventListener('blur', stopBoost, true);

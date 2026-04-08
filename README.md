@@ -9,11 +9,14 @@
 - 长按键盘右方向键 `ArrowRight` 超过 `150ms`，临时切到 `3x`
 - 松开右方向键后，恢复到页面原本的播放速度
 - 短按右方向键时，尽量保留页面自带的快进行为
-- 放行 `Command + 1~9`，避免页面脚本拦截 Chrome 的切标签快捷键
+- 按 `F` 键时，调用播放器自带的全屏 / 退出全屏按钮
+- 全屏播放结束后，自动播放右侧章节列表里的下一节
+- 右侧“章节目录”面板默认自动收起
+- 放行 `Command + 1~9`、`Command + W`、`Command + R`，避免页面脚本拦截 Chrome 快捷键
 
 ## 当前文件
 
-- [tampermonkey-bjy-right-click.user.js](/Users/zhangyu/Documents/project/chrome插件/倍速播放/tampermonkey-bjy-right-click.user.js)
+- `tampermonkey-bjy-right-click.user.js`
 
 ## 可调参数
 
@@ -22,18 +25,21 @@
 - `TARGET_RATE = 3`
 - `HOLD_DELAY = 150`
 - `FORWARD_KEY = 'ArrowRight'`
+- `FULLSCREEN_KEY = 'f'`
 
 ## 快捷键说明
 
 - `ArrowRight` 短按：尽量保持页面原本快进
 - `ArrowRight` 长按：进入临时 `3x`
-- `Command + 1~9`：继续由 Chrome 处理，用来切换标签页
+- `F`：调用播放器原生全屏 / 退出全屏
+- 当前视频在全屏结束时：自动点下一节
+- `Command + 1~9`、`Command + W`、`Command + R`：继续由 Chrome 处理
 
 ## 安装方式
 
 1. 在 Chrome 中安装 Tampermonkey
 2. 打开篡改猴的“实用工具”
-3. 将 [tampermonkey-bjy-right-click.user.js](/Users/zhangyu/Documents/project/chrome插件/倍速播放/tampermonkey-bjy-right-click.user.js) 导入进去
+3. 将 `tampermonkey-bjy-right-click.user.js` 导入进去
 4. 刷新启航录播页面测试
 
 ## 适用范围

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BJY Right Click Control
 // @namespace    http://tampermonkey.net/
-// @version      2.8.0
+// @version      2.8.1
 // @description  长按方向右键临时三倍速，支持播放器原生全屏、全屏播完自动下一节，并默认收起右侧目录
 // @match        https://pre.iqihang.com/ark/record/*
 // @grant        none
@@ -52,6 +52,8 @@
   let lastAutoAdvanceAt = 0;
   let fullscreenRestoreUntil = 0;
   let autoPlayAttemptToken = 0;
+  let boostUsedUiSync = false;
+  let pendingRateUiRestore = null;
 
   function ensureBadge() {
     if (badgeEl && document.contains(badgeEl)) return badgeEl;
@@ -235,12 +237,13 @@
   function fireMouseEvent(el, type) {
     if (!el) return;
     const point = getElementCenter(el);
+    const isPressEvent = type === 'pointerdown' || type === 'mousedown';
     const eventInit = {
       bubbles: true,
       cancelable: true,
       view: window,
       button: 0,
-      buttons: 1,
+      buttons: isPressEvent ? 1 : 0,
       ...point,
     };
     const EventCtor =
@@ -380,6 +383,19 @@
     trySelect(0);
   }
 
+  function shouldSyncRateViaUi() {
+    return !isPlayerFullscreenActive();
+  }
+
+  function flushPendingRateUiRestore() {
+    if (!pendingRateUiRestore) return;
+    if (shouldSyncRateViaUi() === false) return;
+
+    const restoreSpec = pendingRateUiRestore;
+    pendingRateUiRestore = null;
+    selectRateViaUi(restoreSpec, () => {});
+  }
+
   function clearHoldTimer() {
     if (!holdTimer) return;
     clearTimeout(holdTimer);
@@ -415,6 +431,8 @@
     }
 
     boosting = true;
+    boostUsedUiSync = false;
+    pendingRateUiRestore = null;
     clearBoostTimer();
 
     if (activeVideo) {
@@ -425,7 +443,8 @@
       }, 120);
     }
 
-    if (trigger) {
+    if (trigger && shouldSyncRateViaUi()) {
+      boostUsedUiSync = true;
       selectRateViaUi(
         {
           labels: buildRateLabels(TARGET_RATE),
@@ -433,6 +452,8 @@
         },
         () => {},
       );
+    } else {
+      leaveRateControl();
     }
 
     updateBadge('BJY RC 3x', '#166534');
@@ -452,20 +473,25 @@
       activeVideo.defaultPlaybackRate = originalRate || 1;
     }
 
-    if (restoreLabel || restoreValue) {
-      selectRateViaUi(
-        {
-          labels: restoreLabel ? [restoreLabel] : [],
-          values: restoreValue ? [restoreValue] : [],
-        },
-        () => {},
-      );
+    if (boostUsedUiSync && (restoreLabel || restoreValue)) {
+      const restoreSpec = {
+        labels: restoreLabel ? [restoreLabel] : [],
+        values: restoreValue ? [restoreValue] : [],
+      };
+
+      if (shouldSyncRateViaUi()) {
+        selectRateViaUi(restoreSpec, () => {});
+      } else {
+        pendingRateUiRestore = restoreSpec;
+        leaveRateControl();
+      }
     } else {
       leaveRateControl();
     }
 
     activeVideo = null;
     boosting = false;
+    boostUsedUiSync = false;
     originalRateLabel = '';
     originalRateValue = '';
     updateBadge('BJY RC ready', '#1d4ed8');
@@ -905,6 +931,8 @@
     window.addEventListener('keyup', allowBrowserShortcut, true);
     document.addEventListener('keydown', onFullscreenKeyDown, true);
     document.addEventListener('keydown', onForwardKeyDown, true);
+    document.addEventListener('fullscreenchange', flushPendingRateUiRestore, true);
+    document.addEventListener('webkitfullscreenchange', flushPendingRateUiRestore, true);
     window.addEventListener('keyup', onForwardKeyUp, true);
     window.addEventListener('blur', stopBoost, true);
     document.addEventListener(

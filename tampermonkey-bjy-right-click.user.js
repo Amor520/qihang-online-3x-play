@@ -63,11 +63,9 @@
   let hasAutoCollapsedRightPanel = false;
   let lastAutoAdvanceKey = '';
   let lastAutoAdvanceAt = 0;
-  let fullscreenRestoreUntil = 0;
   let autoPlayAttemptToken = 0;
   let boostUsedUiSync = false;
   let pendingRateUiRestore = null;
-  let pendingNativeFullscreenRestore = false;
   let cursorHideTimer = null;
   let cursorHidden = false;
   let cursorAutoHideActive = false;
@@ -714,9 +712,6 @@
 
   function onTrustedPointerActivity(event) {
     if (!event || event.isTrusted === false) return;
-    if (event.type === 'mousedown' || event.type === 'mouseup') {
-      tryRestoreNativeFullscreen();
-    }
     if (!cursorAutoHideActive) return;
 
     if (cursorHidden) showCursor();
@@ -1081,43 +1076,6 @@
     return clickElement(target);
   }
 
-  function tryRestoreNativeFullscreen() {
-    if (!pendingNativeFullscreenRestore) return false;
-    if (Date.now() > fullscreenRestoreUntil) {
-      pendingNativeFullscreenRestore = false;
-      fullscreenRestoreUntil = 0;
-      return false;
-    }
-    if (isPlayerFullscreenActive()) {
-      pendingNativeFullscreenRestore = false;
-      fullscreenRestoreUntil = 0;
-      return false;
-    }
-
-    const root = getFullscreenRoot();
-    if (!root) return false;
-
-    prepareManagedFullscreenRoot(root);
-    const requested = requestNativeFullscreen(root);
-    if (!requested) {
-      clearManagedFullscreenRoot();
-      return false;
-    }
-
-    window.setTimeout(() => {
-      if (isPlayerFullscreenActive()) {
-        pendingNativeFullscreenRestore = false;
-        fullscreenRestoreUntil = 0;
-        return;
-      }
-
-      if (managedFullscreenPreparedEl !== root && managedFullscreenRootEl !== root) return;
-      clearManagedFullscreenRoot();
-    }, 120);
-
-    return true;
-  }
-
   function onFullscreenKeyDown(event) {
     if (!isFullscreenKeyEvent(event)) return;
     if (isEditableTarget(event.target)) return;
@@ -1146,14 +1104,6 @@
     event.stopPropagation();
     event.stopImmediatePropagation();
     toggleFullscreen();
-  }
-
-  function onTrustedKeyInteraction(event) {
-    if (!event || event.isTrusted === false) return;
-    if (isEditableTarget(event.target)) return;
-    if (isFullscreenKeyEvent(event)) return;
-    if (event.metaKey || event.ctrlKey || event.altKey) return;
-    tryRestoreNativeFullscreen();
   }
 
   function getBestRightPanel() {
@@ -1248,23 +1198,7 @@
     return items.slice(activeIndex + 1).find(Boolean) || null;
   }
 
-  function scheduleFullscreenRestoreChecks() {
-    [180, 450, 900, 1600, 2600].forEach((delay) => {
-      window.setTimeout(() => {
-        if (Date.now() > fullscreenRestoreUntil) return;
-        if (isPlayerFullscreenActive()) {
-          pendingNativeFullscreenRestore = false;
-          return;
-        }
-
-        // Browser policy blocks silent re-entry into native fullscreen.
-        // We keep a short restore window and retry on the next real user click.
-        pendingNativeFullscreenRestore = true;
-      }, delay);
-    });
-  }
-
-  function advanceToNextChapter({ preserveFullscreen = false } = {}) {
+  function advanceToNextChapter() {
     const activeItem = getActiveChapterItem();
     const nextItem = findNextChapterItem();
     if (!activeItem || !nextItem) return false;
@@ -1284,7 +1218,6 @@
       updateBadge('BJY RC next lesson', '#166534');
       // Make sure the next lesson tries to play even when the <video> node is reused.
       scheduleAutoPlay(trackedVideo || getMainVideo());
-      if (preserveFullscreen) scheduleFullscreenRestoreChecks();
     }
 
     return clicked;
@@ -1292,18 +1225,13 @@
 
   function handleVideoEnded() {
     const preserveFullscreen = isPlayerFullscreenActive();
-    pendingNativeFullscreenRestore = false;
-    fullscreenRestoreUntil = preserveFullscreen
-      ? Date.now() + FULLSCREEN_RESTORE_WINDOW
-      : 0;
     if (preserveFullscreen) {
       holdNativeFullscreenExit();
     } else {
       clearNativeFullscreenExitHold();
     }
-    const advanced = advanceToNextChapter({ preserveFullscreen });
+    const advanced = advanceToNextChapter();
     if (!advanced) {
-      fullscreenRestoreUntil = 0;
       clearNativeFullscreenExitHold();
       updateBadge('BJY RC list end', '#92400e');
     }
@@ -1311,14 +1239,7 @@
 
   function handleTrackedVideoPlayable() {
     tryAutoPlay(trackedVideo);
-    if (Date.now() > fullscreenRestoreUntil) {
-      clearNativeFullscreenExitHold();
-      return;
-    }
-    if (isPlayerFullscreenActive()) {
-      clearNativeFullscreenExitHold();
-    }
-    scheduleFullscreenRestoreChecks();
+    clearNativeFullscreenExitHold();
   }
 
   function bindVideoListeners() {
@@ -1440,7 +1361,6 @@
 
     document.addEventListener('keydown', allowBrowserShortcut, true);
     window.addEventListener('keyup', allowBrowserShortcut, true);
-    document.addEventListener('keydown', onTrustedKeyInteraction, true);
     document.addEventListener('keydown', onFullscreenKeyDown, true);
     document.addEventListener('click', onManagedFullscreenButtonClick, true);
     window.addEventListener('keydown', onForwardKeyDown, true);
@@ -1449,13 +1369,7 @@
       'fullscreenchange',
       () => {
         flushPendingRateUiRestore();
-        if (isPlayerFullscreenActive()) {
-          pendingNativeFullscreenRestore = false;
-          fullscreenRestoreUntil = 0;
-          clearNativeFullscreenExitHold();
-        } else {
-          clearNativeFullscreenExitHold();
-        }
+        clearNativeFullscreenExitHold();
         syncManagedFullscreenRoot();
         syncCursorAutoHideState();
       },
@@ -1465,13 +1379,7 @@
       'webkitfullscreenchange',
       () => {
         flushPendingRateUiRestore();
-        if (isPlayerFullscreenActive()) {
-          pendingNativeFullscreenRestore = false;
-          fullscreenRestoreUntil = 0;
-          clearNativeFullscreenExitHold();
-        } else {
-          clearNativeFullscreenExitHold();
-        }
+        clearNativeFullscreenExitHold();
         syncManagedFullscreenRoot();
         syncCursorAutoHideState();
       },

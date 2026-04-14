@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BJY Right Click Control
 // @namespace    http://tampermonkey.net/
-// @version      2.8.1
+// @version      2.9.1
 // @description  长按方向右键临时三倍速，支持播放器原生全屏、全屏播完自动下一节，并默认收起右侧目录
 // @match        https://pre.iqihang.com/ark/record/*
 // @grant        none
@@ -17,6 +17,9 @@
   const FULLSCREEN_KEY = 'f';
   const AUTO_ADVANCE_COOLDOWN = 1500;
   const FULLSCREEN_RESTORE_WINDOW = 5000;
+  const CURSOR_HIDE_IDLE_DELAY = 1400;
+  const FULLSCREEN_RECT_RATIO = 0.88;
+  const FULLSCREEN_EDGE_TOLERANCE = 24;
   const AUTO_PLAY_RETRY_DELAYS = [120, 500, 1200, 2400, 4000, 6500];
   const RATE_TRIGGER_SELECTORS = [
     '.ccH5sp',
@@ -54,6 +57,10 @@
   let autoPlayAttemptToken = 0;
   let boostUsedUiSync = false;
   let pendingRateUiRestore = null;
+  let cursorHideTimer = null;
+  let cursorHidden = false;
+  let cursorAutoHideActive = false;
+  let cursorHideStyleEl = null;
 
   function ensureBadge() {
     if (badgeEl && document.contains(badgeEl)) return badgeEl;
@@ -90,6 +97,27 @@
     if (color) el.style.background = color;
   }
 
+  function ensureCursorHideStyle() {
+    if (cursorHideStyleEl && document.contains(cursorHideStyleEl)) return cursorHideStyleEl;
+
+    const styleEl = document.createElement('style');
+    styleEl.id = 'bjy-rc-hide-cursor-style';
+    styleEl.textContent = [
+      'html.bjy-rc-hide-cursor,',
+      'html.bjy-rc-hide-cursor * {',
+      '  cursor: none !important;',
+      '}',
+    ].join('\n');
+
+    const mount = document.head || document.documentElement;
+    if (mount) {
+      mount.appendChild(styleEl);
+      cursorHideStyleEl = styleEl;
+    }
+
+    return styleEl;
+  }
+
   function normalizeText(text) {
     return String(text || '')
       .replace(/\s+/g, '')
@@ -107,6 +135,25 @@
     if (style.display === 'none' || style.visibility === 'hidden') return false;
     const rect = el.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
+  }
+
+  function elementLooksViewportSized(el) {
+    if (!isVisibleElement(el)) return false;
+
+    const rect = el.getBoundingClientRect();
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+    if (!viewportWidth || !viewportHeight) return false;
+
+    const widthRatio = rect.width / viewportWidth;
+    const heightRatio = rect.height / viewportHeight;
+    if (widthRatio < FULLSCREEN_RECT_RATIO || heightRatio < FULLSCREEN_RECT_RATIO) return false;
+
+    const nearLeft = rect.left <= FULLSCREEN_EDGE_TOLERANCE;
+    const nearTop = rect.top <= FULLSCREEN_EDGE_TOLERANCE;
+    const nearRight = Math.abs(viewportWidth - rect.right) <= FULLSCREEN_EDGE_TOLERANCE;
+    const nearBottom = Math.abs(viewportHeight - rect.bottom) <= FULLSCREEN_EDGE_TOLERANCE;
+    return nearLeft && nearTop && nearRight && nearBottom;
   }
 
   function isSpeedText(text) {
@@ -408,6 +455,72 @@
     boostTimer = null;
   }
 
+  function clearCursorHideTimer() {
+    if (!cursorHideTimer) return;
+    clearTimeout(cursorHideTimer);
+    cursorHideTimer = null;
+  }
+
+  function showCursor() {
+    document.documentElement.classList.remove('bjy-rc-hide-cursor');
+    cursorHidden = false;
+  }
+
+  function hideCursor() {
+    if (!cursorAutoHideActive || !isPlayerFullscreenActive()) return;
+    ensureCursorHideStyle();
+    document.documentElement.classList.add('bjy-rc-hide-cursor');
+    cursorHidden = true;
+  }
+
+  function scheduleCursorHide() {
+    clearCursorHideTimer();
+    if (!cursorAutoHideActive) return;
+
+    cursorHideTimer = window.setTimeout(() => {
+      if (!cursorAutoHideActive || !isPlayerFullscreenActive()) return;
+      hideCursor();
+    }, CURSOR_HIDE_IDLE_DELAY);
+  }
+
+  function enableCursorAutoHide() {
+    cursorAutoHideActive = true;
+    showCursor();
+    scheduleCursorHide();
+  }
+
+  function disableCursorAutoHide() {
+    cursorAutoHideActive = false;
+    clearCursorHideTimer();
+    showCursor();
+  }
+
+  function syncCursorAutoHideState() {
+    const shouldEnable = isPlayerFullscreenActive();
+    if (shouldEnable === cursorAutoHideActive) return;
+
+    if (shouldEnable) {
+      enableCursorAutoHide();
+      return;
+    }
+
+    disableCursorAutoHide();
+  }
+
+  function onTrustedPointerActivity(event) {
+    if (!event || event.isTrusted === false) return;
+    if (!cursorAutoHideActive) return;
+
+    if (cursorHidden) showCursor();
+    scheduleCursorHide();
+  }
+
+  function refreshCursorAutoHide() {
+    if (!cursorAutoHideActive) return;
+    showCursor();
+    scheduleCursorHide();
+  }
+
   function resetHoldState() {
     forwardKeyHeld = false;
     clearHoldTimer();
@@ -655,12 +768,24 @@
   }
 
   function isPlayerFullscreenActive() {
+    if (document.fullscreenElement || document.webkitFullscreenElement) return true;
+
     const exitButton = getPlayerFullscreenExitButton(false);
     const enterButton = getPlayerFullscreenEnterButton(false);
+    const video = getMainVideo();
 
     if (exitButton && isVisibleElement(exitButton)) return true;
     if (enterButton && isVisibleElement(enterButton)) return false;
-    if (document.fullscreenElement || document.webkitFullscreenElement) return true;
+
+    if (video) {
+      if (elementLooksViewportSized(video)) return true;
+
+      let node = video.parentElement;
+      while (node && node !== document.body && node !== document.documentElement) {
+        if (elementLooksViewportSized(node)) return true;
+        node = node.parentElement;
+      }
+    }
 
     return false;
   }
@@ -920,6 +1045,7 @@
     const pageObserver = new MutationObserver(() => {
       bindIfReady();
       if (!hasAutoCollapsedRightPanel) collapseRightPanelIfNeeded();
+      syncCursorAutoHideState();
     });
 
     pageObserver.observe(document.documentElement, {
@@ -931,17 +1057,58 @@
     window.addEventListener('keyup', allowBrowserShortcut, true);
     document.addEventListener('keydown', onFullscreenKeyDown, true);
     document.addEventListener('keydown', onForwardKeyDown, true);
-    document.addEventListener('fullscreenchange', flushPendingRateUiRestore, true);
-    document.addEventListener('webkitfullscreenchange', flushPendingRateUiRestore, true);
+    document.addEventListener(
+      'fullscreenchange',
+      () => {
+        flushPendingRateUiRestore();
+        syncCursorAutoHideState();
+      },
+      true,
+    );
+    document.addEventListener(
+      'webkitfullscreenchange',
+      () => {
+        flushPendingRateUiRestore();
+        syncCursorAutoHideState();
+      },
+      true,
+    );
+    document.addEventListener('pointermove', onTrustedPointerActivity, true);
+    document.addEventListener('mousemove', onTrustedPointerActivity, true);
+    document.addEventListener('mousedown', onTrustedPointerActivity, true);
+    document.addEventListener('mouseup', onTrustedPointerActivity, true);
+    document.addEventListener('wheel', onTrustedPointerActivity, true);
     window.addEventListener('keyup', onForwardKeyUp, true);
-    window.addEventListener('blur', stopBoost, true);
+    window.addEventListener(
+      'blur',
+      () => {
+        stopBoost();
+        disableCursorAutoHide();
+      },
+      true,
+    );
+    window.addEventListener(
+      'focus',
+      () => {
+        syncCursorAutoHideState();
+        refreshCursorAutoHide();
+      },
+      true,
+    );
     document.addEventListener(
       'visibilitychange',
       () => {
         if (document.hidden) stopBoost();
+        if (document.hidden) {
+          disableCursorAutoHide();
+          return;
+        }
+        syncCursorAutoHideState();
+        refreshCursorAutoHide();
       },
       true,
     );
+    syncCursorAutoHideState();
   }
 
   if (document.readyState === 'loading') {

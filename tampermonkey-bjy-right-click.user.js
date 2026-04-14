@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BJY Right Click Control
 // @namespace    http://tampermonkey.net/
-// @version      2.10.0
-// @description  长按方向右键临时三倍速；F 或播放器按钮进入稳定原生全屏；全屏自动隐藏鼠标；播完自动下一节
+// @version      2.11.0
+// @description  长按方向右键临时三倍速；L 切换固定 3x/1x；F 或播放器按钮进入稳定原生全屏；全屏自动隐藏鼠标；播完自动下一节
 // @match        https://pre.iqihang.com/ark/record/*
 // @grant        none
 // @run-at       document-start
@@ -12,14 +12,24 @@
   'use strict';
 
   const TARGET_RATE = 3;
+  const NORMAL_RATE = 1;
   const HOLD_DELAY = 150;
   const FORWARD_KEY = 'ArrowRight';
   const FULLSCREEN_KEY = 'f';
+  const FIXED_RATE_TOGGLE_KEY = 'l';
+  const FIXED_RATE_STORAGE_KEY = 'bjy-rc-fixed-rate-mode';
   const FULLSCREEN_FORWARD_SEEK_SECONDS = 5;
   const AUTO_ADVANCE_COOLDOWN = 1500;
   const FULLSCREEN_RESTORE_WINDOW = 5000;
   const CURSOR_HIDE_IDLE_DELAY = 1400;
   const AUTO_PLAY_RETRY_DELAYS = [120, 500, 1200, 2400, 4000, 6500];
+  const MANUAL_PAUSE_INTENT_WINDOW = 1200;
+  const ARROW_KEY_ALIASES = Object.freeze({
+    y: { key: 'ArrowUp', code: 'ArrowUp' },
+    h: { key: 'ArrowDown', code: 'ArrowDown' },
+    g: { key: 'ArrowLeft', code: 'ArrowLeft' },
+    j: { key: FORWARD_KEY, code: 'ArrowRight' },
+  });
   const FULLSCREEN_EXIT_METHOD_NAMES = [
     'exitFullscreen',
     'webkitExitFullscreen',
@@ -64,6 +74,9 @@
   let lastAutoAdvanceKey = '';
   let lastAutoAdvanceAt = 0;
   let autoPlayAttemptToken = 0;
+  let lastManualPauseIntentAt = 0;
+  let manualPauseLock = null;
+  let fixedRateMode = 'normal';
   let boostUsedUiSync = false;
   let pendingRateUiRestore = null;
   let cursorHideTimer = null;
@@ -202,6 +215,65 @@
 
   function normalizeKey(key) {
     return String(key || '').trim().toLowerCase();
+  }
+
+  function loadFixedRateMode() {
+    try {
+      return window.localStorage.getItem(FIXED_RATE_STORAGE_KEY) === '3x' ? '3x' : 'normal';
+    } catch (error) {
+      return 'normal';
+    }
+  }
+
+  function persistFixedRateMode() {
+    try {
+      window.localStorage.setItem(FIXED_RATE_STORAGE_KEY, fixedRateMode);
+    } catch (error) {
+      // Ignore storage failures from restricted contexts.
+    }
+  }
+
+  function isFixedRateFastMode() {
+    return fixedRateMode === '3x';
+  }
+
+  function getDesiredFixedRate() {
+    return isFixedRateFastMode() ? TARGET_RATE : NORMAL_RATE;
+  }
+
+  function buildRateSpec(rate) {
+    const numeric = Number(rate);
+    const labels = buildRateLabels(numeric);
+
+    if (numeric === NORMAL_RATE) {
+      labels.unshift(normalizeText('正常'));
+    }
+
+    return {
+      labels,
+      values: buildRateValues(numeric),
+    };
+  }
+
+  function getDesiredFixedRateSpec() {
+    return buildRateSpec(getDesiredFixedRate());
+  }
+
+  function getFixedRateBadgeText() {
+    return isFixedRateFastMode() ? 'BJY RC fixed 3x' : 'BJY RC fixed 1x';
+  }
+
+  function getArrowAliasMapping(event) {
+    if (!event || event.metaKey || event.ctrlKey || event.altKey) return null;
+    return ARROW_KEY_ALIASES[normalizeKey(event.key)] || null;
+  }
+
+  function matchesArrowKey(event, arrowKey) {
+    if (!event) return false;
+    if (event.key === arrowKey) return true;
+
+    const mapping = getArrowAliasMapping(event);
+    return !!mapping && mapping.key === arrowKey;
   }
 
   function isVisibleElement(el) {
@@ -497,6 +569,70 @@
     const restoreSpec = pendingRateUiRestore;
     pendingRateUiRestore = null;
     selectRateViaUi(restoreSpec, () => {});
+  }
+
+  function applyPlaybackRateValue(video, rate) {
+    if (!video) return false;
+
+    const numeric = Number(rate);
+    if (!Number.isFinite(numeric) || numeric <= 0) return false;
+
+    let changed = false;
+    if (Math.abs((Number(video.playbackRate) || NORMAL_RATE) - numeric) > 0.01) {
+      video.playbackRate = numeric;
+      changed = true;
+    }
+
+    if (Math.abs((Number(video.defaultPlaybackRate) || NORMAL_RATE) - numeric) > 0.01) {
+      video.defaultPlaybackRate = numeric;
+      changed = true;
+    }
+
+    return changed;
+  }
+
+  function syncFixedRateUi() {
+    const desiredSpec = getDesiredFixedRateSpec();
+    if (!shouldSyncRateViaUi()) {
+      pendingRateUiRestore = desiredSpec;
+      return;
+    }
+
+    pendingRateUiRestore = null;
+    selectRateViaUi(desiredSpec, () => {});
+  }
+
+  function applyFixedRate(video = trackedVideo || getMainVideo(), options = {}) {
+    const { syncUi = false, force = false } = options;
+    if (!video) return false;
+    if (boosting && !force) return false;
+
+    const changed = applyPlaybackRateValue(video, getDesiredFixedRate());
+    if (syncUi) syncFixedRateUi();
+    return changed;
+  }
+
+  function syncBoostRestoreRateWithFixedMode() {
+    const desiredRate = getDesiredFixedRate();
+    const desiredSpec = getDesiredFixedRateSpec();
+    originalRate = desiredRate;
+    originalRateLabel = desiredSpec.labels[0] || '';
+    originalRateValue = desiredSpec.values[0] || '';
+  }
+
+  function toggleFixedRateMode() {
+    fixedRateMode = isFixedRateFastMode() ? 'normal' : '3x';
+    persistFixedRateMode();
+
+    if (boosting) {
+      syncBoostRestoreRateWithFixedMode();
+      pendingRateUiRestore = getDesiredFixedRateSpec();
+      updateBadge(getFixedRateBadgeText(), '#166534');
+      return;
+    }
+
+    applyFixedRate(trackedVideo || getMainVideo(), { syncUi: true });
+    updateBadge(getFixedRateBadgeText(), '#166534');
   }
 
   function clearHoldTimer() {
@@ -834,7 +970,13 @@
   }
 
   function isForwardKeyEvent(event) {
-    return !!event && event.key === FORWARD_KEY;
+    return matchesArrowKey(event, FORWARD_KEY);
+  }
+
+  function isFixedRateToggleKeyEvent(event) {
+    if (!event) return false;
+    if (event.metaKey || event.ctrlKey || event.altKey) return false;
+    return normalizeKey(event.key) === FIXED_RATE_TOGGLE_KEY;
   }
 
   function isBrowserShortcut(event) {
@@ -869,6 +1011,37 @@
     if (!event) return false;
     if (event.metaKey || event.ctrlKey || event.altKey) return false;
     return normalizeKey(event.key) === FULLSCREEN_KEY;
+  }
+
+  function remapArrowAliasKey(event) {
+    if (!event || event.isTrusted === false) return;
+    if (isEditableTarget(event.target)) return;
+
+    const mapping = getArrowAliasMapping(event);
+    if (!mapping) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    const dispatchTarget =
+      event.target && typeof event.target.dispatchEvent === 'function' ? event.target : document;
+
+    const remappedEvent = new KeyboardEvent(event.type, {
+      key: mapping.key,
+      code: mapping.code,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      repeat: !!event.repeat,
+      location: event.location || 0,
+      shiftKey: !!event.shiftKey,
+      ctrlKey: false,
+      altKey: false,
+      metaKey: false,
+    });
+
+    dispatchTarget.dispatchEvent(remappedEvent);
   }
 
   function getVisibleElementBySelectors(selectors, root = document) {
@@ -919,7 +1092,7 @@
   }
 
   function tryAutoPlay(video = getMainVideo()) {
-    if (!video || isVideoPlaying(video)) return;
+    if (!video || isVideoPlaying(video) || isManualPauseLocked(video)) return;
 
     const tryButtonFallback = () => {
       if (isVideoPlaying(video) || !video.paused || video.ended) return;
@@ -964,6 +1137,7 @@
         if (!document.contains(video)) return;
         if (isVideoPlaying(video)) return;
         if (video.ended) return;
+        if (isManualPauseLocked(video)) return;
         tryAutoPlay(video);
       }, delay);
     });
@@ -1180,6 +1354,88 @@
     return `${idPart}|${textPart}`;
   }
 
+  function getActiveChapterKey() {
+    return getChapterItemKey(getActiveChapterItem());
+  }
+
+  function getVideoSourceKey(video) {
+    if (!video) return '';
+
+    const directSrc = String(video.currentSrc || video.src || '').trim();
+    if (directSrc) return directSrc;
+
+    return Array.from(video.querySelectorAll('source'))
+      .map((source) => String(source.src || '').trim())
+      .filter(Boolean)
+      .join('|');
+  }
+
+  function capturePlaybackContext(video = trackedVideo || getMainVideo()) {
+    return {
+      chapterKey: getActiveChapterKey(),
+      sourceKey: getVideoSourceKey(video),
+      videoId: video && video.id ? String(video.id) : '',
+      videoRef: video || null,
+    };
+  }
+
+  function doesPlaybackContextMatch(savedContext, video = trackedVideo || getMainVideo()) {
+    if (!savedContext || !video) return false;
+    if (savedContext.videoRef === video) return true;
+
+    const currentContext = capturePlaybackContext(video);
+
+    if (savedContext.chapterKey && currentContext.chapterKey) {
+      return savedContext.chapterKey === currentContext.chapterKey;
+    }
+
+    if (savedContext.sourceKey && currentContext.sourceKey) {
+      return savedContext.sourceKey === currentContext.sourceKey;
+    }
+
+    if (savedContext.videoId && currentContext.videoId) {
+      return savedContext.videoId === currentContext.videoId;
+    }
+
+    return false;
+  }
+
+  function rememberManualPauseIntent() {
+    lastManualPauseIntentAt = Date.now();
+  }
+
+  function clearManualPauseIntent() {
+    lastManualPauseIntentAt = 0;
+  }
+
+  function hasRecentManualPauseIntent() {
+    if (!lastManualPauseIntentAt) return false;
+
+    if (Date.now() - lastManualPauseIntentAt > MANUAL_PAUSE_INTENT_WINDOW) {
+      clearManualPauseIntent();
+      return false;
+    }
+
+    return true;
+  }
+
+  function setManualPauseLock(video = trackedVideo || getMainVideo()) {
+    if (!video) return;
+    manualPauseLock = capturePlaybackContext(video);
+  }
+
+  function clearManualPauseLock() {
+    manualPauseLock = null;
+  }
+
+  function isManualPauseLocked(video = trackedVideo || getMainVideo()) {
+    if (!manualPauseLock || !video) return false;
+    if (doesPlaybackContextMatch(manualPauseLock, video)) return true;
+
+    clearManualPauseLock();
+    return false;
+  }
+
   function findNextChapterItem() {
     const activeItem = getActiveChapterItem();
     if (!activeItem) return null;
@@ -1215,6 +1471,8 @@
     const target = nextItem.querySelector(CHAPTER_ITEM_CLICK_SELECTOR) || nextItem;
     const clicked = clickElement(target);
     if (clicked) {
+      clearManualPauseLock();
+      clearManualPauseIntent();
       updateBadge('BJY RC next lesson', '#166534');
       // Make sure the next lesson tries to play even when the <video> node is reused.
       scheduleAutoPlay(trackedVideo || getMainVideo());
@@ -1237,9 +1495,63 @@
     }
   }
 
+  function handleTrackedVideoPause() {
+    if (!trackedVideo || trackedVideo.ended) return;
+
+    if (hasRecentManualPauseIntent()) {
+      setManualPauseLock(trackedVideo);
+    }
+
+    clearManualPauseIntent();
+  }
+
+  function handleTrackedVideoPlay() {
+    applyFixedRate(trackedVideo);
+    clearManualPauseLock();
+    clearManualPauseIntent();
+    clearNativeFullscreenExitHold();
+  }
+
   function handleTrackedVideoPlayable() {
+    applyFixedRate(trackedVideo);
+    if (isManualPauseLocked(trackedVideo)) return;
     tryAutoPlay(trackedVideo);
     clearNativeFullscreenExitHold();
+  }
+
+  function handleTrackedVideoRateChange() {
+    applyFixedRate(trackedVideo);
+  }
+
+  function isPlaybackToggleKeyEvent(event) {
+    if (!event) return false;
+    if (event.metaKey || event.ctrlKey || event.altKey) return false;
+
+    const key = normalizeKey(event.key);
+    return event.code === 'Space' || key === 'spacebar' || key === 'k' || key === 'mediaplaypause';
+  }
+
+  function isPlaybackToggleTarget(target, video = trackedVideo || getMainVideo()) {
+    if (!target || !(target instanceof Element)) return false;
+
+    if (target.closest(PLAYER_PLAY_SELECTORS.join(','))) return true;
+    return !!(video && (target === video || target.closest('video') === video));
+  }
+
+  function captureManualPauseIntent(event) {
+    if (!event || event.isTrusted === false) return;
+    if (event.type === 'keydown' && isEditableTarget(event.target)) return;
+
+    const video = trackedVideo || getMainVideo();
+    if (!video || video.paused) return;
+
+    if (event.type === 'keydown') {
+      if (!isPlaybackToggleKeyEvent(event)) return;
+    } else if (!isPlaybackToggleTarget(event.target, video)) {
+      return;
+    }
+
+    rememberManualPauseIntent();
   }
 
   function bindVideoListeners() {
@@ -1248,7 +1560,9 @@
 
     if (trackedVideo) {
       trackedVideo.removeEventListener('ended', handleVideoEnded, true);
-      trackedVideo.removeEventListener('play', handleTrackedVideoPlayable, true);
+      trackedVideo.removeEventListener('pause', handleTrackedVideoPause, true);
+      trackedVideo.removeEventListener('play', handleTrackedVideoPlay, true);
+      trackedVideo.removeEventListener('ratechange', handleTrackedVideoRateChange, true);
       trackedVideo.removeEventListener('canplay', handleTrackedVideoPlayable, true);
       trackedVideo.removeEventListener('loadedmetadata', handleTrackedVideoPlayable, true);
     }
@@ -1257,9 +1571,12 @@
     if (!trackedVideo) return false;
 
     trackedVideo.addEventListener('ended', handleVideoEnded, true);
-    trackedVideo.addEventListener('play', handleTrackedVideoPlayable, true);
+    trackedVideo.addEventListener('pause', handleTrackedVideoPause, true);
+    trackedVideo.addEventListener('play', handleTrackedVideoPlay, true);
+    trackedVideo.addEventListener('ratechange', handleTrackedVideoRateChange, true);
     trackedVideo.addEventListener('canplay', handleTrackedVideoPlayable, true);
     trackedVideo.addEventListener('loadedmetadata', handleTrackedVideoPlayable, true);
+    applyFixedRate(trackedVideo, { syncUi: true });
     scheduleAutoPlay(trackedVideo);
     return true;
   }
@@ -1323,8 +1640,21 @@
     setDebugAction('forwardUp');
   }
 
+  function onFixedRateToggleKeyDown(event) {
+    if (!isFixedRateToggleKeyEvent(event)) return;
+    if (isEditableTarget(event.target)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    if (event.repeat) return;
+    toggleFixedRateMode();
+  }
+
   function init() {
     window.__BJY_RIGHT_CLICK_CONTROL__ = 'loaded';
+    fixedRateMode = loadFixedRateMode();
     suppressBeforeUnloadPrompt();
     installNativeFullscreenExitGuard();
     ensureBadge();
@@ -1361,8 +1691,14 @@
 
     document.addEventListener('keydown', allowBrowserShortcut, true);
     window.addEventListener('keyup', allowBrowserShortcut, true);
+    window.addEventListener('keydown', remapArrowAliasKey, true);
+    document.addEventListener('keydown', remapArrowAliasKey, true);
+    window.addEventListener('keyup', remapArrowAliasKey, true);
     document.addEventListener('keydown', onFullscreenKeyDown, true);
+    document.addEventListener('keydown', onFixedRateToggleKeyDown, true);
     document.addEventListener('click', onManagedFullscreenButtonClick, true);
+    document.addEventListener('mousedown', captureManualPauseIntent, true);
+    document.addEventListener('keydown', captureManualPauseIntent, true);
     window.addEventListener('keydown', onForwardKeyDown, true);
     document.addEventListener('keydown', onForwardKeyDown, true);
     document.addEventListener(

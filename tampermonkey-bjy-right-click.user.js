@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BJY Right Click Control
 // @namespace    http://tampermonkey.net/
-// @version      2.11.0
-// @description  长按方向右键临时三倍速；L 切换固定 3x/1x；F 或播放器按钮进入稳定原生全屏；全屏自动隐藏鼠标；播完自动下一节
+// @version      2.12.1
+// @description  长按方向右键临时三倍速；L 切换 3x/1x；鼠标仍可手动切换其他倍速；F 或播放器按钮进入稳定原生全屏；全屏自动隐藏鼠标；播完自动下一节
 // @match        https://pre.iqihang.com/ark/record/*
 // @grant        none
 // @run-at       document-start
@@ -76,7 +76,7 @@
   let autoPlayAttemptToken = 0;
   let lastManualPauseIntentAt = 0;
   let manualPauseLock = null;
-  let fixedRateMode = 'normal';
+  let fixedRateMode = '1x';
   let boostUsedUiSync = false;
   let pendingRateUiRestore = null;
   let cursorHideTimer = null;
@@ -137,6 +137,16 @@
       'html.bjy-rc-hide-cursor,',
       'html.bjy-rc-hide-cursor * {',
       '  cursor: none !important;',
+      '}',
+      '',
+      // When we auto-hide the cursor in fullscreen, also force-hide the player's control bar.
+      // Some players keep the bar visible forever if the mouse is "hovering" over it.
+      'html.bjy-rc-hide-cursor .ccH5playerBox > section,',
+      'html.bjy-rc-hide-cursor .vjs-control-bar,',
+      'html.bjy-rc-hide-cursor .vjs-big-play-button {',
+      '  opacity: 0 !important;',
+      '  visibility: hidden !important;',
+      '  pointer-events: none !important;',
       '}',
     ].join('\n');
 
@@ -219,9 +229,9 @@
 
   function loadFixedRateMode() {
     try {
-      return window.localStorage.getItem(FIXED_RATE_STORAGE_KEY) === '3x' ? '3x' : 'normal';
+      return window.localStorage.getItem(FIXED_RATE_STORAGE_KEY) === '3x' ? '3x' : '1x';
     } catch (error) {
-      return 'normal';
+      return '1x';
     }
   }
 
@@ -260,7 +270,18 @@
   }
 
   function getFixedRateBadgeText() {
-    return isFixedRateFastMode() ? 'BJY RC fixed 3x' : 'BJY RC fixed 1x';
+    return isFixedRateFastMode() ? 'BJY RC 3x' : 'BJY RC 1x';
+  }
+
+  function getCurrentPlaybackRate(video = trackedVideo || getMainVideo()) {
+    const videoRate = Number(video && video.playbackRate);
+    if (Number.isFinite(videoRate) && videoRate > 0) return videoRate;
+
+    const currentState = getCurrentRateState();
+    const stateValue = Number(currentState.value);
+    if (Number.isFinite(stateValue) && stateValue > 0) return stateValue;
+
+    return NORMAL_RATE;
   }
 
   function getArrowAliasMapping(event) {
@@ -621,7 +642,11 @@
   }
 
   function toggleFixedRateMode() {
-    fixedRateMode = isFixedRateFastMode() ? 'normal' : '3x';
+    if (boosting) {
+      fixedRateMode = isFixedRateFastMode() ? '1x' : '3x';
+    } else {
+      fixedRateMode = Math.abs(getCurrentPlaybackRate() - TARGET_RATE) < 0.01 ? '1x' : '3x';
+    }
     persistFixedRateMode();
 
     if (boosting) {
@@ -1506,21 +1531,15 @@
   }
 
   function handleTrackedVideoPlay() {
-    applyFixedRate(trackedVideo);
     clearManualPauseLock();
     clearManualPauseIntent();
     clearNativeFullscreenExitHold();
   }
 
   function handleTrackedVideoPlayable() {
-    applyFixedRate(trackedVideo);
     if (isManualPauseLocked(trackedVideo)) return;
     tryAutoPlay(trackedVideo);
     clearNativeFullscreenExitHold();
-  }
-
-  function handleTrackedVideoRateChange() {
-    applyFixedRate(trackedVideo);
   }
 
   function isPlaybackToggleKeyEvent(event) {
@@ -1562,7 +1581,6 @@
       trackedVideo.removeEventListener('ended', handleVideoEnded, true);
       trackedVideo.removeEventListener('pause', handleTrackedVideoPause, true);
       trackedVideo.removeEventListener('play', handleTrackedVideoPlay, true);
-      trackedVideo.removeEventListener('ratechange', handleTrackedVideoRateChange, true);
       trackedVideo.removeEventListener('canplay', handleTrackedVideoPlayable, true);
       trackedVideo.removeEventListener('loadedmetadata', handleTrackedVideoPlayable, true);
     }
@@ -1573,10 +1591,8 @@
     trackedVideo.addEventListener('ended', handleVideoEnded, true);
     trackedVideo.addEventListener('pause', handleTrackedVideoPause, true);
     trackedVideo.addEventListener('play', handleTrackedVideoPlay, true);
-    trackedVideo.addEventListener('ratechange', handleTrackedVideoRateChange, true);
     trackedVideo.addEventListener('canplay', handleTrackedVideoPlayable, true);
     trackedVideo.addEventListener('loadedmetadata', handleTrackedVideoPlayable, true);
-    applyFixedRate(trackedVideo, { syncUi: true });
     scheduleAutoPlay(trackedVideo);
     return true;
   }
